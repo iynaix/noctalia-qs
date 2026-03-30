@@ -153,9 +153,12 @@ private:
 	std::vector<float> mPeak; // peak tracking for gravity falloff
 	std::vector<float> mFall; // fall accumulator per band (gravity)
 	std::vector<float> mMem; // integral filter memory per band
+	std::vector<float> mBands; // reusable per-frame band buffer
 	float mSensitivity = 1.0f;
 	float mPeakAvg = 0.0f;
 	bool mSensInit = true;
+	double mCachedGravityMod = 1.0;
+	int mCachedGravityFrameRate = 0;
 
 	std::vector<std::complex<float>> mFftBuf;
 };

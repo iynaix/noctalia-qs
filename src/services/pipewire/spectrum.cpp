@@ -373,6 +373,7 @@ void PwAudioSpectrum::setNoiseReduction(qreal amount) {
 	amount = std::clamp(amount, 0.0, 1.0);
 	if (qFuzzyCompare(amount, this->mNoiseReduction)) return;
 	this->mNoiseReduction = amount;
+	this->mCachedGravityFrameRate = 0; // invalidate gravity cache
 	emit this->noiseReductionChanged();
 }
 
@@ -459,7 +460,9 @@ void PwAudioSpectrum::initProcessing() {
 	this->mPeak.assign(this->mBandCount, 0.0f);
 	this->mFall.assign(this->mBandCount, 0.0f);
 	this->mMem.assign(this->mBandCount, 0.0f);
+	this->mBands.assign(this->mBandCount, 0.0f);
 	this->mValues = QList<float>(this->mBandCount, 0.0f);
+	this->mCachedGravityFrameRate = 0; // force recompute
 	this->computeBandBins();
 }
 
@@ -524,6 +527,9 @@ void PwAudioSpectrum::onFrameTick() { this->processFrame(); }
 void PwAudioSpectrum::processFrame() {
 	if (!this->mRingFull) return;
 
+	// Already idle - skip all processing
+	if (this->mIdle && !this->mSamplesReceived) return;
+
 	// 0. If no new samples arrived since last frame, fade the ring buffer toward
 	//    silence so stale data doesn't keep the bands stuck when the audio source closes.
 	if (!this->mSamplesReceived) {
@@ -543,23 +549,24 @@ void PwAudioSpectrum::processFrame() {
 	fft(this->mFftBuf.data(), FFT_SIZE);
 
 	// 3. Map FFT bins to bands using logarithmic frequency distribution.
-	//    For each band, take the peak magnitude across its frequency range.
-	std::vector<float> bands(this->mBandCount, 0.0f);
+	//    For each band, take the peak magnitude squared across its frequency range,
+	//    then sqrt once per band (avoids sqrt per bin).
+	auto& bands = this->mBands;
 	for (int i = 0; i < this->mBandCount; i++) {
-		float maxMag = 0.0f;
+		float maxMagSq = 0.0f;
 		for (int bin = this->mBandBinLow[i]; bin <= this->mBandBinHigh[i]; bin++) {
-			float mag = std::abs(this->mFftBuf[bin]);
-			maxMag = std::max(maxMag, mag);
+			float magSq = std::norm(this->mFftBuf[bin]);
+			if (magSq > maxMagSq) maxMagSq = magSq;
 		}
-		bands[i] = maxMag;
+		bands[i] = std::sqrt(maxMagSq);
 	}
 
 	// 4. Frequency weighting: perceptual boost for lower frequencies.
 	//    Low-frequency bands cover fewer FFT bins and need compensation.
+	auto invBandCount = 1.0f / static_cast<float>(this->mBandCount);
 	for (int i = 0; i < this->mBandCount; i++) {
 		float weight = 1.0f
-		    + 0.5f * static_cast<float>(this->mBandCount - i)
-		          / static_cast<float>(this->mBandCount);
+		    + 0.5f * static_cast<float>(this->mBandCount - i) * invBandCount;
 		bands[i] *= weight;
 	}
 
@@ -573,19 +580,23 @@ void PwAudioSpectrum::processFrame() {
 	}
 
 	// 6. Auto-sensitivity: apply current sensitivity, then adjust conservatively.
-	//    Mirrors cava's approach: 2% decrease on overshoot, 0.1% increase per frame.
+	//    2% decrease on overshoot, 0.1% increase per frame.
 	for (auto& band: bands) {
 		band *= this->mSensitivity;
 	}
 
-	// 7. Gravity falloff + integral smoothing (cava-style).
+	// 7. Gravity falloff + integral smoothing.
 	//    Gravity: when a band drops, it falls from its stored peak with quadratic
 	//    acceleration, giving a natural physics-based decay.
 	//    Integral: IIR low-pass filter (memory * noiseReduction + current) damps
 	//    rapid transients for a smoother, less jittery response.
-	auto fps = static_cast<double>(this->mFrameRate);
-	double gravityMod = std::pow(60.0 / fps, 2.5) * 1.54 / std::max(this->mNoiseReduction, 0.01);
-	if (gravityMod < 1.0) gravityMod = 1.0;
+	if (this->mCachedGravityFrameRate != this->mFrameRate) {
+		auto fps = static_cast<double>(this->mFrameRate);
+		this->mCachedGravityMod = std::pow(60.0 / fps, 2.5) * 1.54 / std::max(this->mNoiseReduction, 0.01);
+		if (this->mCachedGravityMod < 1.0) this->mCachedGravityMod = 1.0;
+		this->mCachedGravityFrameRate = this->mFrameRate;
+	}
+	auto gravityMod = this->mCachedGravityMod;
 
 	bool overshoot = false;
 	bool silence = true;
@@ -605,7 +616,7 @@ void PwAudioSpectrum::processFrame() {
 		this->mPrevBands[i] = bands[i];
 
 		// Integral smoothing
-		bands[i] = this->mMem[i] * static_cast<float>(this->mNoiseReduction) + bands[i];
+		bands[i] = this->mMem[i] * nrFactor + bands[i];
 		this->mMem[i] = bands[i];
 
 		if (bands[i] > 1.0f) {
@@ -615,7 +626,7 @@ void PwAudioSpectrum::processFrame() {
 		if (bands[i] > 0.01f) silence = false;
 	}
 
-	// Auto-sensitivity adjustment (conservative, cava-style rates)
+	// Auto-sensitivity adjustment
 	if (overshoot) {
 		this->mSensitivity *= 0.98f;
 		this->mSensInit = false;
@@ -625,19 +636,22 @@ void PwAudioSpectrum::processFrame() {
 	}
 	this->mSensitivity = std::clamp(this->mSensitivity, 0.001f, 50.0f);
 
-	// 8. Monstercat-style spatial smoothing (cava algorithm): each band propagates
-	//    its value to all other bands with exponential distance decay.
-	//    Decay factor 1.5 per unit distance (matching cava's monstercat=1.0 default).
+	// 8. Monstercat-style spatial smoothing: each band propagates
+	//    its value to neighbors with exponential distance decay.
+	//    Uses iterative division instead of std::pow() for the decay factor.
 	if (this->mSmoothing) {
 		constexpr float MONSTERCAT_FACTOR = 1.5f;
+		constexpr float MIN_SPREAD = 0.001f;
 		for (int z = 0; z < this->mBandCount; z++) {
-			for (int m = z - 1; m >= 0; m--) {
-				float spread = bands[z] / std::pow(MONSTERCAT_FACTOR, z - m);
+			float spread = bands[z] / MONSTERCAT_FACTOR;
+			for (int m = z - 1; m >= 0 && spread > MIN_SPREAD; m--) {
 				if (spread > bands[m]) bands[m] = spread;
+				spread /= MONSTERCAT_FACTOR;
 			}
-			for (int m = z + 1; m < this->mBandCount; m++) {
-				float spread = bands[z] / std::pow(MONSTERCAT_FACTOR, m - z);
+			spread = bands[z] / MONSTERCAT_FACTOR;
+			for (int m = z + 1; m < this->mBandCount && spread > MIN_SPREAD; m++) {
 				if (spread > bands[m]) bands[m] = spread;
+				spread /= MONSTERCAT_FACTOR;
 			}
 		}
 	}
@@ -649,8 +663,7 @@ void PwAudioSpectrum::processFrame() {
 
 	// 10. Idle detection: if all bands are near zero for several consecutive frames,
 	//     stop emitting updates to save GPU rendering.
-	bool allZero = silence;
-	if (allZero) {
+	if (silence) {
 		this->mIdleFrames++;
 		if (this->mIdleFrames >= IDLE_THRESHOLD) {
 			if (!this->mIdle) {
@@ -669,14 +682,16 @@ void PwAudioSpectrum::processFrame() {
 		}
 	}
 
-	// 11. Emit updated values to QML
-	QList<float> newValues(this->mBandCount);
+	// 11. Emit updated values to QML (in-place update, no allocation)
+	bool changed = false;
 	for (int i = 0; i < this->mBandCount; i++) {
-		newValues[i] = bands[i];
+		if (this->mValues[i] != bands[i]) {
+			changed = true;
+			this->mValues[i] = bands[i];
+		}
 	}
 
-	if (newValues != this->mValues) {
-		this->mValues = std::move(newValues);
+	if (changed) {
 		emit this->valuesChanged();
 	}
 }
